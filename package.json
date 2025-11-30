@@ -1,0 +1,57 @@
+{
+  "name": "@cloudrumbles/indic-transliterate",
+  "version": "1.1.1",
+  "description": "High-accuracy transliteration for 21 Indian languages using AI4Bharat's IndicXlit models via ONNX.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "models"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "transliteration",
+    "transliterate",
+    "romanization",
+    "indic",
+    "indian-languages",
+    "tamil",
+    "hindi",
+    "bengali",
+    "telugu",
+    "kannada",
+    "malayalam",
+    "gujarati",
+    "marathi",
+    "punjabi",
+    "urdu",
+    "devanagari",
+    "ai4bharat",
+    "indicxlit",
+    "onnx",
+    "nlp",
+    "script-conversion"
+  ],
+  "author": "cloudrumbles",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "onnxruntime-node": "^1.20.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cloudrumbles/indic-transliterate.git"
+  },
+  "trustedDependencies": [
+    "onnxruntime-node"
+  ]
+}
