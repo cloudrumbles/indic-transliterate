@@ -27,6 +27,12 @@ const hindi = await transliterator.transliterate('namaste', 'hi')
 
 // Get more candidates
 const results = await transliterator.transliterate('chennai', 'ta', 10)
+
+// With rescoring (improves accuracy by ~6%)
+const t = new IndicTransliterator({ rescore: true })
+const rescored = await t.transliterate('amma', 'ta', 4)
+// => ['அம்மா', 'ஆம்மா', 'அம்ம', 'ஆமா']
+// Dictionary auto-downloads on first use (~200MB per language)
 ```
 
 ### API
@@ -37,9 +43,11 @@ Creates a new transliterator instance. Models are loaded lazily on first use.
 
 ```typescript
 const transliterator = new IndicTransliterator({
-  beamWidth: 4,   // beam search width (default: 4)
-  maxLen: 20,     // max output length (default: 20)
-  modelPath: '...' // custom model path (default: bundled)
+  beamWidth: 4,      // beam search width (default: 4)
+  maxLen: 20,        // max output length (default: 20)
+  rescore: true,     // use word frequency dict for better accuracy (default: false)
+  rescoreAlpha: 0.9, // model vs dict weight (default: 0.9)
+  modelPath: '...'   // custom model path (default: bundled)
 })
 ```
 

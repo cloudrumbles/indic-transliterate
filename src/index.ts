@@ -1,6 +1,11 @@
 import * as ort from 'onnxruntime-node'
 import path from 'path'
 import fs from 'fs'
+import https from 'https'
+import readline from 'readline'
+import { createWriteStream, createReadStream } from 'fs'
+import { createGunzip } from 'zlib'
+import unzipper from 'unzipper'
 
 // Types
 interface Vocab {
@@ -20,13 +25,15 @@ interface BeamCandidate {
   finished: boolean
 }
 
+type WordProbDict = Map<string, number>
+
 export interface TransliterationOptions {
   /**
    * Beam width for beam search. Higher values give more candidates but are slower.
    * Default: 4
    */
   beamWidth?: number
-  
+
   /**
    * Maximum output length in characters.
    * Default: 20
@@ -38,7 +45,30 @@ export interface TransliterationOptions {
    * Default: bundled models
    */
   modelPath?: string
+
+  /**
+   * Enable rescoring with word probability dictionaries.
+   * Dictionary is auto-downloaded on first use if not present (~200MB per language).
+   * Default: false
+   */
+  rescore?: boolean
+
+  /**
+   * Path to directory containing word probability dictionaries.
+   * Default: {modelPath}/word_prob_dicts
+   */
+  dictPath?: string
+
+  /**
+   * Alpha value for rescoring interpolation.
+   * final_score = alpha * model_score + (1-alpha) * dict_prob
+   * Default: 0.9
+   */
+  rescoreAlpha?: number
 }
+
+// Dictionary download URL (zip file containing all language dicts)
+const DICT_ZIP_URL = 'https://github.com/AI4Bharat/IndicXlit/releases/download/v1.0/word_prob_dicts.zip'
 
 export class IndicTransliterator {
   private encoder: ort.InferenceSession | null = null
@@ -47,11 +77,18 @@ export class IndicTransliterator {
   private modelPath: string
   private beamWidth: number
   private maxLen: number
+  private rescore: boolean
+  private dictPath: string
+  private rescoreAlpha: number
+  private wordProbDicts: Map<string, WordProbDict> = new Map()
 
   constructor(options: TransliterationOptions = {}) {
     this.modelPath = options.modelPath || path.join(__dirname, '../models')
     this.beamWidth = options.beamWidth ?? 4
     this.maxLen = options.maxLen ?? 20
+    this.rescore = options.rescore ?? false
+    this.dictPath = options.dictPath || path.join(this.modelPath, 'word_prob_dicts')
+    this.rescoreAlpha = options.rescoreAlpha ?? 0.9
   }
 
   /**
@@ -81,6 +118,192 @@ export class IndicTransliterator {
       this.decoder = null
     }
     this.vocab = null
+    this.wordProbDicts.clear()
+  }
+
+  /**
+   * Check if word probability dictionary is available for a language.
+   */
+  hasDictionary(langCode: string): boolean {
+    const dictFile = path.join(this.dictPath, `${langCode}_word_prob_dict.json`)
+    return fs.existsSync(dictFile)
+  }
+
+  /**
+   * Load word probability dictionary for a language.
+   * Uses streaming to handle large dictionaries (1GB+).
+   * Called automatically when rescore=true.
+   */
+  private async loadDictionary(langCode: string): Promise<WordProbDict> {
+    if (this.wordProbDicts.has(langCode)) {
+      return this.wordProbDicts.get(langCode)!
+    }
+
+    const dictFile = path.join(this.dictPath, `${langCode}_word_prob_dict.json`)
+
+    if (!fs.existsSync(dictFile)) {
+      throw new Error(
+        `Word probability dictionary not found for '${langCode}'. ` +
+          `Run downloadDictionary('${langCode}') first, or disable rescoring.`
+      )
+    }
+
+    // Stream-parse the JSON file line by line to avoid string length limits
+    // The dictionary is a flat JSON object: {"word1": prob1, "word2": prob2, ...}
+    const dict: WordProbDict = new Map()
+
+    const rl = readline.createInterface({
+      input: createReadStream(dictFile, { encoding: 'utf-8' }),
+      crlfDelay: Infinity,
+    })
+
+    // Regex to extract key-value pairs from JSON lines
+    // Matches: "word": 0.00123 or "word": 1.23e-05
+    const kvRegex = /^\s*"([^"]+)":\s*([0-9.eE+-]+),?\s*$/
+
+    for await (const line of rl) {
+      const match = line.match(kvRegex)
+      if (match) {
+        // Unescape Unicode sequences like \u0b92 to actual characters
+        const word = match[1].replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) =>
+          String.fromCharCode(parseInt(hex, 16))
+        )
+        const prob = parseFloat(match[2])
+        if (!isNaN(prob)) {
+          dict.set(word, prob)
+        }
+      }
+    }
+
+    this.wordProbDicts.set(langCode, dict)
+    return dict
+  }
+
+  /**
+   * Rescore beam search results using word probability dictionary.
+   * Uses interpolation: final = alpha * model_score + (1-alpha) * dict_prob
+   * Words not in dictionary get score 0 (matching original AI4Bharat behavior)
+   */
+  private rescoreResults(
+    candidates: Array<{ word: string; score: number }>,
+    dict: WordProbDict
+  ): Array<{ word: string; score: number }> {
+    if (candidates.length === 0) return candidates
+
+    // Get model scores (already log probs, convert to probs for normalization)
+    const modelProbs = candidates.map((c) => Math.exp(c.score))
+    const totalModelProb = modelProbs.reduce((a, b) => a + b, 0)
+
+    // Get dictionary probabilities (only for words in dict)
+    const dictProbs = candidates.map((c) => dict.get(c.word) || 0)
+    const totalDictProb = dictProbs.reduce((a, b) => a + b, 0)
+
+    // Normalize and interpolate
+    const alpha = this.rescoreAlpha
+    const rescored = candidates.map((c, i) => {
+      const inDict = dict.has(c.word)
+
+      // Words NOT in dictionary get score 0 (matching original AI4Bharat)
+      if (!inDict) {
+        return { word: c.word, score: 0 }
+      }
+
+      const normModelProb = totalModelProb > 0 ? modelProbs[i] / totalModelProb : 0
+      const normDictProb = totalDictProb > 0 ? dictProbs[i] / totalDictProb : 0
+
+      // Interpolated score (higher is better)
+      const finalScore = alpha * normModelProb + (1 - alpha) * normDictProb
+
+      return { word: c.word, score: finalScore }
+    })
+
+    // Sort by final score descending
+    rescored.sort((a, b) => b.score - a.score)
+
+    return rescored
+  }
+
+  /**
+   * Download word probability dictionary for a language.
+   * Downloads from AI4Bharat's IndicXlit releases and extracts the specific language dict.
+   *
+   * @param langCode Language code (e.g., 'ta', 'hi')
+   * @param onProgress Optional progress callback (bytes downloaded, total bytes)
+   */
+  async downloadDictionary(
+    langCode: string,
+    onProgress?: (downloaded: number, total: number) => void
+  ): Promise<void> {
+    const supportedLangs = this.getSupportedLanguages()
+    if (!supportedLangs.includes(langCode)) {
+      throw new Error(`Unsupported language: ${langCode}. Valid: ${supportedLangs.join(', ')}`)
+    }
+
+    // Create dict directory if needed
+    if (!fs.existsSync(this.dictPath)) {
+      fs.mkdirSync(this.dictPath, { recursive: true })
+    }
+
+    const destFile = path.join(this.dictPath, `${langCode}_word_prob_dict.json`)
+    const targetFileName = `word_prob_dicts/${langCode}_word_prob_dict.json`
+
+    return new Promise((resolve, reject) => {
+      const makeRequest = (requestUrl: string, redirectCount = 0) => {
+        if (redirectCount > 10) {
+          reject(new Error('Too many redirects'))
+          return
+        }
+
+        https
+          .get(requestUrl, (res) => {
+            // Handle redirects
+            if (res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307) {
+              const redirectUrl = res.headers.location
+              if (redirectUrl) {
+                makeRequest(redirectUrl, redirectCount + 1)
+                return
+              }
+            }
+
+            if (res.statusCode !== 200) {
+              reject(new Error(`Failed to download dictionary zip: HTTP ${res.statusCode}`))
+              return
+            }
+
+            const totalBytes = parseInt(res.headers['content-length'] || '0', 10)
+            let downloadedBytes = 0
+
+            res.on('data', (chunk: Buffer) => {
+              downloadedBytes += chunk.length
+              onProgress?.(downloadedBytes, totalBytes)
+            })
+
+            let found = false
+
+            res
+              .pipe(unzipper.Parse())
+              .on('entry', (entry: unzipper.Entry) => {
+                if (entry.path === targetFileName) {
+                  found = true
+                  entry.pipe(createWriteStream(destFile))
+                    .on('finish', () => resolve())
+                    .on('error', reject)
+                } else {
+                  entry.autodrain()
+                }
+              })
+              .on('close', () => {
+                if (!found) {
+                  reject(new Error(`Dictionary for '${langCode}' not found in zip`))
+                }
+              })
+              .on('error', reject)
+          })
+          .on('error', reject)
+      }
+
+      makeRequest(DICT_ZIP_URL)
+    })
   }
 
   /**
@@ -299,9 +522,21 @@ export class IndicTransliterator {
       
       candidates.sort((a, b) => b.score - a.score)
       beams = candidates.slice(0, beamWidth)
-      
+
       if (beams.length === 0) break
-      if (finalCandidates.length >= beamWidth * 2) break
+
+      // Only stop early if we have enough finished candidates AND
+      // the best unfinished beam's score is worse than all finished scores
+      if (finalCandidates.length >= beamWidth) {
+        const worstFinishedScore = Math.min(...finalCandidates.map((c) => c.score))
+        const bestUnfinishedScore = beams[0]?.score ?? -Infinity
+        // Apply length penalty estimate to unfinished beam
+        const estimatedLen = beams[0]?.tokens.length + 3 // assume 3 more tokens
+        const lp = Math.pow((5 + estimatedLen) / 6, 1.0)
+        const adjustedUnfinished = bestUnfinishedScore / lp
+        const adjustedFinished = worstFinishedScore / Math.pow((5 + finalCandidates[0].tokens.length) / 6, 1.0)
+        if (adjustedUnfinished < adjustedFinished) break
+      }
     }
     
     for (const beam of beams) {
@@ -310,16 +545,44 @@ export class IndicTransliterator {
     
     // Length penalty normalization (Google NMT)
     const lenPenalty = 1.0
-    const scoredResults = finalCandidates.map(cand => {
+    const scoredResults = finalCandidates.map((cand) => {
       const len = Math.max(1, cand.tokens.length - 1)
       const lp = Math.pow((5 + len) / 6, lenPenalty)
       return { ...cand, normalizedScore: cand.score / lp }
     })
-    
+
     scoredResults.sort((a, b) => b.normalizedScore - a.normalizedScore)
-    
-    const topResults = scoredResults.slice(0, count)
-    return topResults.map(res => this.detokenize(res.tokens))
+
+    // Get more candidates than requested for rescoring
+    const rescoreCount = this.rescore ? Math.max(count * 2, 10) : count
+    const topResults = scoredResults.slice(0, rescoreCount)
+
+    // Detokenize to get words
+    const wordsWithScores = topResults.map((res) => ({
+      word: this.detokenize(res.tokens),
+      score: res.normalizedScore,
+    }))
+
+    // Remove duplicates (keep highest scored)
+    const seen = new Set<string>()
+    const uniqueResults = wordsWithScores.filter((r) => {
+      if (seen.has(r.word)) return false
+      seen.add(r.word)
+      return true
+    })
+
+    // Apply rescoring if enabled
+    if (this.rescore) {
+      // Auto-download dictionary if not present
+      if (!this.hasDictionary(langCode)) {
+        await this.downloadDictionary(langCode)
+      }
+      const dict = await this.loadDictionary(langCode)
+      const rescored = this.rescoreResults(uniqueResults, dict)
+      return rescored.slice(0, count).map((r) => r.word)
+    }
+
+    return uniqueResults.slice(0, count).map((r) => r.word)
   }
 }
 

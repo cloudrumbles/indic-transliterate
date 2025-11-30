@@ -14,6 +14,23 @@ export interface TransliterationOptions {
      * Default: bundled models
      */
     modelPath?: string;
+    /**
+     * Enable rescoring with word probability dictionaries.
+     * Dictionary is auto-downloaded on first use if not present (~200MB per language).
+     * Default: false
+     */
+    rescore?: boolean;
+    /**
+     * Path to directory containing word probability dictionaries.
+     * Default: {modelPath}/word_prob_dicts
+     */
+    dictPath?: string;
+    /**
+     * Alpha value for rescoring interpolation.
+     * final_score = alpha * model_score + (1-alpha) * dict_prob
+     * Default: 0.9
+     */
+    rescoreAlpha?: number;
 }
 export declare class IndicTransliterator {
     private encoder;
@@ -22,6 +39,10 @@ export declare class IndicTransliterator {
     private modelPath;
     private beamWidth;
     private maxLen;
+    private rescore;
+    private dictPath;
+    private rescoreAlpha;
+    private wordProbDicts;
     constructor(options?: TransliterationOptions);
     /**
      * Check if models are loaded.
@@ -35,6 +56,30 @@ export declare class IndicTransliterator {
      * Release ONNX sessions. Call this when done to free memory.
      */
     dispose(): Promise<void>;
+    /**
+     * Check if word probability dictionary is available for a language.
+     */
+    hasDictionary(langCode: string): boolean;
+    /**
+     * Load word probability dictionary for a language.
+     * Uses streaming to handle large dictionaries (1GB+).
+     * Called automatically when rescore=true.
+     */
+    private loadDictionary;
+    /**
+     * Rescore beam search results using word probability dictionary.
+     * Uses interpolation: final = alpha * model_score + (1-alpha) * dict_prob
+     * Words not in dictionary get score 0 (matching original AI4Bharat behavior)
+     */
+    private rescoreResults;
+    /**
+     * Download word probability dictionary for a language.
+     * Downloads from AI4Bharat's IndicXlit releases and extracts the specific language dict.
+     *
+     * @param langCode Language code (e.g., 'ta', 'hi')
+     * @param onProgress Optional progress callback (bytes downloaded, total bytes)
+     */
+    downloadDictionary(langCode: string, onProgress?: (downloaded: number, total: number) => void): Promise<void>;
     /**
      * Initialize the ONNX models.
      * This is called automatically on first request, but can be called manually to warm up.
